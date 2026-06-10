@@ -19,7 +19,7 @@ for ft in "${fusion_types[@]}"; do
     gpu=${gpus[$(( idx % ngpu ))]}
 
     echo "Launching fusion_type=$ft seed=$seed on GPU $gpu…"
-    CUDA_VISIBLE_DEVICES=$gpu nohup python baseline/fusion_train.py \
+    CUDA_VISIBLE_DEVICES=$gpu nohup python -m train.train --mode fusion \
       --fusion_type $ft \
       --seed $seed \
       --synchronized_loading \

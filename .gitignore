@@ -1,0 +1,40 @@
+# data and artifacts
+log/
+logs/
+loss_plots/
+motion_evaluator/
+data/raw/
+data/cache/
+data/FBG/
+data/FoG/
+data/GRF_processed/
+data/WearGait/*
+!data/WearGait/
+!data/WearGait/weargait_encoders.py
+data/*.csv
+data/*.docx
+data/*.xlsx
+*.out
+*.log
+*.log1
+*.pyc
+__pycache__/
+
+# local backup copies
+* copy.py
+
+
+# ignore large files
+*.pt
+*.pth
+*.pkl
+*.npy
+*.npz
+*.h5
+*.zip
+
+# ignore system and editor files
+.DS_Store
+Thumbs.db
+.ipynb_checkpoints/
+.env
