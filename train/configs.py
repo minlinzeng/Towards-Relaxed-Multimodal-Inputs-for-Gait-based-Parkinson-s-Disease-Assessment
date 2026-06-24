@@ -31,6 +31,112 @@ FBG_FOG_PARAMS = {
     },
 }
 
+FBG_FOG_PARAM_PRESETS = {
+    "fog_sync_best_param": {
+        "dataset": "fog",
+        "sync_required": True,
+        "description": "FoG sync setting: multimodal class-weighted loss, one shared task head, no train oversampling.",
+        "train_params": {
+            "epochs": 100,
+            "batch_size": 256,
+        },
+        "args": {
+            "wm": "class_wt",
+            "alpha": 0.0,
+            "consistency_lambda": 0.0,
+            "use_norm_and_cos": False,
+            "legacy_gcl_head": False,
+            "sync_train_oversample": False,
+        },
+    },
+    "fog_sync_trip_ce_alpha09": {
+        "dataset": "fog",
+        "sync_required": True,
+        "description": "FoG sync no-class-rebalancing ablation: CE + CAGrad alpha=0.9, one shared task head, no train oversampling.",
+        "train_params": {
+            "epochs": 100,
+            "batch_size": 256,
+        },
+        "args": {
+            "wm": "ce",
+            "alpha": 0.9,
+            "consistency_lambda": 0.0,
+            "use_norm_and_cos": False,
+            "legacy_gcl_head": False,
+            "sync_train_oversample": False,
+        },
+    },
+    "fog_best_param": {
+        "dataset": "fog",
+        "description": "Final FoG async ours: old-ablation cosine-head training with tuned CAGrad/GCL.",
+        "train_params": {
+            "epochs": 50,
+            "batch_size": 256,
+        },
+        "args": {
+            "wm": "gcl",
+            "alpha": 0.3,
+            "max_norm": 0.0,
+            "sgd_momentum": 0.9,
+            "weight_decay": 1e-4,
+            "patience": 100,
+            "consistency_lambda": 1.0,
+            "gcl_s": 40,
+            "gcl_m": 0.4,
+            "noise_mul": 0.0,
+            "drw_warmup": 5,
+            "use_norm_and_cos": True,
+            "legacy_gcl_head": False,
+        },
+    },
+}
+
+WEARGAIT_GRAV = 9.81
+WEARGAIT_ROOT = "data/WearGait"
+WEARGAIT_HC_PATH = f"{WEARGAIT_ROOT}/HC"
+WEARGAIT_PD_PATH = f"{WEARGAIT_ROOT}/PD"
+WEARGAIT_HC_DEMO_CSV = f"{WEARGAIT_HC_PATH}/hc_demographic.csv"
+WEARGAIT_PD_DEMO_CSV = f"{WEARGAIT_PD_PATH}/pd_demographic.csv"
+WEARGAIT_PREPROC_DIR = f"{WEARGAIT_ROOT}/WearGait_preproc_SPmT_30Hz"
+WEARGAIT_CSV_PATTERN = "*_SelfPace_matTURN.csv"
+
+WEARGAIT_IMU_SITES = [
+    "L_Ankle",
+    "R_Ankle",
+    "L_DorsalFoot",
+    "R_DorsalFoot",
+    "L_MidLatThigh",
+    "R_MidLatThigh",
+    "L_LatShank",
+    "R_LatShank",
+]
+
+WEARGAIT_INSOLE_NUMERIC = [
+    "LTotalForce_BW",
+    "RTotalForce_BW",
+    "SumForce_BW",
+    "LCoP_X",
+    "LCoP_Y",
+    "RCoP_X",
+    "RCoP_Y",
+    "Linsole_Acc_X",
+    "Linsole_Acc_Y",
+    "Linsole_Acc_Z",
+    "Rinsole_Acc_X",
+    "Rinsole_Acc_Y",
+    "Rinsole_Acc_Z",
+]
+
+WEARGAIT_WALKWAY_NUMERIC = ["L Foot Pressure_BW", "R Foot Pressure_BW"]
+WEARGAIT_IMU_AXES = ("E", "N", "U")
+WEARGAIT_IMU_FIXED = [
+    f"{site}_FreeAcc_{axis}"
+    for site in WEARGAIT_IMU_SITES
+    for axis in WEARGAIT_IMU_AXES
+]
+WEARGAIT_INSOLE_FIXED = WEARGAIT_INSOLE_NUMERIC[:]
+WEARGAIT_WALKWAY_FIXED = WEARGAIT_WALKWAY_NUMERIC[:]
+
 DATASET_ALIASES = {
     "fbg": "fbg",
     "fog": "fog",

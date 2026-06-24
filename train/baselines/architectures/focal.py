@@ -1,7 +1,7 @@
-from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional
 
 from feature_encoder import (
     SkeletonMLP, SensorEncoder, SharedBackbone, TaskHead
@@ -43,16 +43,19 @@ class FOCALSharedLatentBaseline(nn.Module):
         backbone_dim: int = 8,
         num_classes: int = 2,
         use_norm_head: bool = False,
-        use_cosine_head: bool = False
+        use_cosine_head: bool = False,
     ):
         super().__init__()
 
         # Encoders
-        self.skel_enc = SkeletonMLP(skeleton_input_dim, skeleton_output_dim)
+        self.skel_enc = SkeletonMLP(
+            skeleton_input_dim,
+            skeleton_output_dim,
+        )
         self.sens_enc = SensorEncoder(
             in_channels=sensor_in_channels,
             out_channels=sensor_out_channels,
-            sensor_length=sensor_length
+            sensor_length=sensor_length,
         )
 
         # Projectors: shared & private per modality

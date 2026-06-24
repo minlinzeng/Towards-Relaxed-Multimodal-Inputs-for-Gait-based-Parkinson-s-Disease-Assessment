@@ -1,7 +1,17 @@
 # file: deepav_train.py
 # Compact DeepAVFusion trainer. Uses utility helpers to cut boilerplate.
 
-import argparse, numpy as np, torch, torch.nn.functional as F
+import argparse, sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TRAIN_ROOT = Path(__file__).resolve().parents[1]
+for path in (PROJECT_ROOT, TRAIN_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+import numpy as np, torch, torch.nn.functional as F
 from baselines.architectures.deepav import DeepAVLite
 from data_processing.preprocess_fbg import PDReader
 from data_processing.preprocess_fog import pdfeReader
@@ -12,15 +22,32 @@ from learning.training_common import (
     get_branch_class_counts, class_weight_tensor,
     print_class_balance, print_eval_matrix, count_params
 )
+from learning.missing_ratio import (
+    TWO_MODALITY_SUBSETS,
+    eval_two_modality_missing_ratio_sync,
+    eval_two_modality_subset_sync,
+    parse_ratio_list,
+)
 from const.path import get_pd_paths
+try:
+    from configs import FBG_FOG_PARAMS
+except ImportError:
+    from train.configs import FBG_FOG_PARAMS
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- config (unchanged names) ----
 PATHS = get_pd_paths()
 HP = {
-    "fbg": dict(pose_length=101, sensor_length=65,  num_classes=3, lr=1e-3, epochs=100, batch=256),
-    "fog": dict(pose_length=101, sensor_length=426, num_classes=3, lr=1e-3, epochs=100, batch=256),
+    dataset: dict(
+        pose_length=params["pose_length"],
+        sensor_length=params["sensor_length"],
+        num_classes=params["num_classes"],
+        lr=params["learning_rate"],
+        epochs=100,
+        batch=params["batch_size"],
+    )
+    for dataset, params in FBG_FOG_PARAMS.items()
 }
 # ----------------------------------
 
@@ -46,11 +73,10 @@ def _build_model(train_loader, num_classes, need_async_heads: bool, args):
         share_blocks=True, share_unimodal=True, attn_bottleneck=8
     ).to(device)
     
-    total = count_params(m)                 # trainable params
-    print(f"Total params: {total:,}")
-
     if need_async_heads and hasattr(m, "_ensure_async_heads"):
         m._ensure_async_heads(num_classes)
+    total = count_params(m)                 # trainable params
+    print(f"Total params: {total:,}")
     return m
 
 
@@ -124,6 +150,7 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
     ce_fn, w_sk, w_se = _criterion(args.wm, train_loader, hp["num_classes"])
 
     best_score, best = -1.0, {}
+    best_state = None
     patience, noimp = 60, 0
 
     for ep in range(1, hp["epochs"]+1):
@@ -138,7 +165,9 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
             print(f"[Fold {fold}] Ep{ep}: loss {tl:.3f}/{vl:.3f} | sk {vsk:.1f}% | se {vse:.1f}% | avg {avg:.1f}%")
             score = avg
 
-        if score > best_score: best_score, best, noimp = score, re, 0
+        if score > best_score:
+            best_score, best, noimp = score, re, 0
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             noimp += 1
             if noimp >= patience:
@@ -146,6 +175,39 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
                 break
 
     if args.synced:
+        if args.eval_missing_ratios and best_state is not None:
+            model.load_state_dict(best_state, strict=True)
+
+            def predict_logits(skel, sens, use_skel, use_sens):
+                logits, _ = model(skel, sens, synced=True)
+                return logits
+
+            for available, missing, use_skel, use_sens in TWO_MODALITY_SUBSETS:
+                score = eval_two_modality_subset_sync(
+                    model, eval_loader, device, flatten_skel, predict_logits, use_skel, use_sens
+                )
+                args._subset_scores[available].append(float(score))
+                print(
+                    f"[SYNC][available={available}][missing={missing}] "
+                    f"acc={score:5.2f}% over {len(eval_loader.dataset)} samples"
+                )
+
+            for ratio_idx, ratio in enumerate(args._missing_ratios):
+                repeat_scores = []
+                for rep in range(args.missing_ratio_repeats):
+                    ratio_seed = args.seed * 100000 + fold * 1000 + ratio_idx * 100 + rep
+                    score = eval_two_modality_missing_ratio_sync(
+                        model, eval_loader, ratio, ratio_seed, device, flatten_skel, predict_logits
+                    )
+                    repeat_scores.append(float(score))
+                repeat_arr = np.array(repeat_scores, dtype=float)
+                args._missing_ratio_scores[ratio].append(float(repeat_arr.mean()))
+                print(
+                    f"[SYNC][missing_ratio={ratio:.2f}] "
+                    f"fold_mean={repeat_arr.mean():5.2f}% ± {repeat_arr.std():4.2f}% "
+                    f"over {args.missing_ratio_repeats} repeats"
+                )
+
         print(f"\n>>> Fold {fold} Best Acc: {best_score:.2f}%")
         print_eval_matrix(best, synced=True)
         return best_score, 0.0, best_score
@@ -158,6 +220,11 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
 
 def main(args):
     set_seed(args.seed)
+    print("Arguments:", args)
+    print("Dataset params:", HP[args.dataset])
+    args._missing_ratios = parse_ratio_list(args.missing_ratios)
+    args._missing_ratio_scores = {ratio: [] for ratio in args._missing_ratios}
+    args._subset_scores = {available: [] for available, *_ in TWO_MODALITY_SUBSETS}
     reader = _reader(args.dataset, seed=args.seed, rebuild_cache=args.rebuild_cache)
     folds = generate_class_stratified_folds(reader, args.dataset, exclude_subjects=["SUB10","SUB30","SUB22"])
 
@@ -168,6 +235,22 @@ def main(args):
     out = np.array(out)
     if args.synced:
         _, _, mav = out.mean(axis=0); print(f"\nMean Acc: {mav:.2f}%")
+        if args.eval_missing_ratios and all(args._missing_ratio_scores.values()):
+            if all(args._subset_scores.values()):
+                print("\n=== Modality-subset accuracy at best epoch (sync deterministic mask) ===")
+                print("Policy: deterministic subset evaluation; missing modalities are zero-filled.")
+                for available, missing, *_ in TWO_MODALITY_SUBSETS:
+                    subset_arr = np.array(args._subset_scores[available], dtype=float)
+                    print(
+                        f"[available={available}][missing={missing}] "
+                        f"{subset_arr.mean():5.2f}% ± {subset_arr.std():4.2f}%  over {len(subset_arr)} folds"
+                    )
+
+            print("\n=== Missing-ratio accuracy at best epoch (sync inference stress test) ===")
+            print(f"Policy: sample-level Method B, {args.missing_ratio_repeats} repeats per fold; selected samples miss one modality.")
+            for ratio in args._missing_ratios:
+                ratio_arr = np.array(args._missing_ratio_scores[ratio], dtype=float)
+                print(f"[ratio={ratio:.2f}] {ratio_arr.mean():5.2f}% ± {ratio_arr.std():4.2f}%  over {len(ratio_arr)} folds")
     else:
         msk, mse, mav = out.mean(axis=0); print(f"\nMean skel={msk:.2f}%  sensor={mse:.2f}%  avg={mav:.2f}%")
 
@@ -178,4 +261,10 @@ if __name__ == "__main__":
         p.add_argument("--wm", choices=["ce","class_wt"], default="ce")
         p.add_argument("--seed", type=int, default=43)
         p.add_argument("--rebuild_cache", action="store_true", help="Rebuild the dataset .pkl cache before training")
+        p.add_argument("--eval_missing_ratios", action="store_true",
+                       help="Run sync-only sample-level inference-time missing-ratio evaluation after the best epoch.")
+        p.add_argument("--missing_ratios", type=str, default="0.2,0.4,0.6,0.8",
+                       help="Comma-separated missing ratios for --eval_missing_ratios.")
+        p.add_argument("--missing_ratio_repeats", type=int, default=5,
+                       help="Random repeats per fold for --eval_missing_ratios.")
         main(p.parse_args())

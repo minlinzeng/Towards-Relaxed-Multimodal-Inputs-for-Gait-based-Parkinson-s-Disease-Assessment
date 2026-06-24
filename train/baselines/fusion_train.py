@@ -1,5 +1,7 @@
 import random
 import argparse
+import sys
+from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,47 +9,36 @@ import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import classification_report
 from collections import Counter
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TRAIN_ROOT = Path(__file__).resolve().parents[1]
+for path in (PROJECT_ROOT, TRAIN_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 from data_processing.preprocess_fbg import PDReader
 from data_processing.preprocess_fog import pdfeReader
 from feature_encoder import EarlyFusionModel, LateFusionModel, ShareLatentModel, CheapXAttnModel
 from data_processing.dataset_cache import load_reader
 from data_processing.dataloader_fbg_fog import create_fusion_loaders
+from learning.training_common import count_params, generate_class_stratified_folds as shared_generate_class_stratified_folds
 from const.path import get_pd_paths
+from learning.missing_ratio import (
+    TWO_MODALITY_SUBSETS,
+    eval_two_modality_missing_ratio_sync,
+    eval_two_modality_subset_sync,
+    parse_ratio_list,
+)
+try:
+    from configs import FBG_FOG_PARAMS
+except ImportError:
+    from train.configs import FBG_FOG_PARAMS
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 PATHS = get_pd_paths()
-
-MODALITY_PARAMS = {
-    "fbg": {
-        "skeleton_input_dim": 51,
-        "skeleton_output_dim": 3,
-        "sensor_in_channels": 3,
-        "sensor_out_channels": 3,
-        "sensor_length": 65,
-        "pose_length": 101,
-        "shared_out_channels": 16,
-        "backbone_dim": 8,
-        "num_classes": 3,
-        "learning_rate": 1e-3,
-        "epochs": 50,
-        "batch_size": 32,  
-    },
-    "fog": {
-        "skeleton_input_dim": 21,
-        "skeleton_output_dim": 6,
-        "sensor_in_channels": 6,
-        "sensor_out_channels": 6,
-        "sensor_length": 150,
-        "pose_length": 101,
-        "shared_out_channels": 16,
-        "backbone_dim": 8,
-        "num_classes": 3,
-        "learning_rate": 1e-3,
-        "epochs": 50,
-        "batch_size": 256,
-    }
-}
+MODALITY_PARAMS = {dataset: dict(params) for dataset, params in FBG_FOG_PARAMS.items()}
 
 def set_random_seed(seed: int):
     random.seed(seed)
@@ -95,59 +86,11 @@ def create_dataloader(dataset: str, reader, train_subj: list, eval_subj: list):
     return params, train_loader, eval_loader
 
 def generate_class_stratified_folds(reader, dataset: str):
-    """
-    - fbg: only subjects with both pose & sensor go into eval folds;
-           train = the rest of those (still filtered later for missing data)
-    - fog: unchanged behavior
-    """
-    from collections import defaultdict
-    import random
-
-    if dataset == "fbg":
-        # 1) find prefixes that truly have both modalities
-        pose_pfx = { "_".join(k.split("_")[:2]) for k in reader.pose_dict.keys() }
-        sens_pfx = { "_".join(k.split("_")[:2]) for k in reader.sensor_dict.keys() }
-        both_modal = pose_pfx & sens_pfx
-
-        # 2) only keep labels for those both‐modal subjects
-        raw_labels = reader.pose_label_dict
-        label_dict = { s: raw_labels[s] for s in raw_labels if s in both_modal }
-
-    elif dataset == "fog":
-        label_dict = {
-            s: reader.labels_dict[s][0]
-            for s in reader.labels_dict
-            if s not in ("SUB10","SUB30","SUB22")
-        }
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
-
-    # 3) group subjects by class
-    class_to_subj = defaultdict(list)
-    for subj, lbl in label_dict.items():
-        class_to_subj[lbl].append(subj)
-
-    # 4) number of folds = size of smallest class
-    m = min(len(lst) for lst in class_to_subj.values())
-    if m == 0:
-        raise ValueError("Need at least one subject per class with both modalities for FBG")
-
-    # 5) balance up/down to m subjects per class
-    balanced = {}
-    for lbl, subs in class_to_subj.items():
-        if len(subs) > m:
-            subs = random.sample(subs, k=m)
-        random.shuffle(subs)
-        balanced[lbl] = subs
-
-    # 6) build the folds
-    folds = []
-    for i in range(m):
-        eval_subj = [balanced[lbl][i] for lbl in sorted(balanced)]
-        train_subj = [s for s in label_dict if s not in eval_subj]
-        folds.append((train_subj, eval_subj))
-
-    return folds
+    return shared_generate_class_stratified_folds(
+        reader,
+        dataset,
+        exclude_subjects=["SUB10", "SUB30", "SUB22"],
+    )
 
 
 def train_one_fold(fold_idx, reader, folds, args):
@@ -164,13 +107,18 @@ def train_one_fold(fold_idx, reader, folds, args):
         w = 1.0 / (t + 1e-8)
         return w / w.sum() * num_classes
 
+    skel_counts = get_class_counts(train_loader, num_classes, "label_skeleton")
+    sens_counts = get_class_counts(train_loader, num_classes, "label_sensor")
+    skel_weights = make_weights(skel_counts) if args.wm == "class_wt" else None
+    sens_weights = make_weights(sens_counts) if args.wm == "class_wt" else None
+
     # choose loss(es)
     if args.synchronized_loading and args.fusion_type != "share_latent":
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(weight=skel_weights)
     else:
         # for share_latent-sync or any async mode, we need two heads
-        criterion_skel = nn.CrossEntropyLoss()
-        criterion_sens = nn.CrossEntropyLoss()
+        criterion_skel = nn.CrossEntropyLoss(weight=skel_weights)
+        criterion_sens = nn.CrossEntropyLoss(weight=sens_weights)
 
     # ——— model instantiation ———
     common_kwargs = dict(
@@ -182,7 +130,7 @@ def train_one_fold(fold_idx, reader, folds, args):
         shared_out_channels  = params["shared_out_channels"],
         backbone_dim         = params["backbone_dim"],
         num_classes          = params["num_classes"],
-        synchronized_loading = args.synchronized_loading
+        synchronized_loading = args.synchronized_loading,
     )
 
     if args.fusion_type == "early":
@@ -198,12 +146,14 @@ def train_one_fold(fold_idx, reader, folds, args):
         model = CheapXAttnModel(**common_kwargs).to(device)
     else:
         raise ValueError(f"Unknown fusion_type: {args.fusion_type}")
+    print(f"Total params: {count_params(model):,}")
 
     optimizer = optim.Adam(model.parameters(), lr=params["learning_rate"])
 
     best_avg_acc = 0.0
     best_skel_acc = 0.0
     best_sens_acc = 0.0
+    best_state = None
 
     # storage for best predictions
     if args.synchronized_loading and args.fusion_type != "share_latent":
@@ -310,6 +260,7 @@ def train_one_fold(fold_idx, reader, folds, args):
         # update best
         if e_avg > best_avg_acc:
             best_avg_acc = e_avg
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if args.synchronized_loading and args.fusion_type != "share_latent":
                 best_trues, best_preds = trues, preds
                 best_skel_acc = best_sens_acc = e_acc
@@ -343,6 +294,47 @@ def train_one_fold(fold_idx, reader, folds, args):
         print("Sensor   Head Report:")
         print(classification_report(best_trues_sens, best_preds_sens, digits=2, zero_division=0))
 
+    if args.eval_missing_ratios and args.synchronized_loading and best_state is not None:
+        model.load_state_dict(best_state, strict=True)
+
+        def predict_logits(skel, sens, use_skel, use_sens):
+            if args.fusion_type != "share_latent":
+                return model(skel, sens)
+
+            log_skel, log_sens = model(skel, sens)
+            probs = []
+            if use_skel:
+                probs.append(F.softmax(log_skel, dim=1))
+            if use_sens:
+                probs.append(F.softmax(log_sens, dim=1))
+            return sum(probs) / len(probs)
+
+        for available, missing, use_skel, use_sens in TWO_MODALITY_SUBSETS:
+            score = eval_two_modality_subset_sync(
+                model, eval_loader, device, flatten_skel, predict_logits, use_skel, use_sens
+            )
+            args._subset_scores[available].append(float(score))
+            print(
+                f"[SYNC][available={available}][missing={missing}] "
+                f"acc={score:5.2f}% over {len(eval_loader.dataset)} samples"
+            )
+
+        for ratio_idx, ratio in enumerate(args._missing_ratios):
+            repeat_scores = []
+            for rep in range(args.missing_ratio_repeats):
+                ratio_seed = args.seed * 100000 + fold_idx * 1000 + ratio_idx * 100 + rep
+                score = eval_two_modality_missing_ratio_sync(
+                    model, eval_loader, ratio, ratio_seed, device, flatten_skel, predict_logits
+                )
+                repeat_scores.append(float(score))
+            repeat_arr = np.array(repeat_scores, dtype=float)
+            args._missing_ratio_scores[ratio].append(float(repeat_arr.mean()))
+            print(
+                f"[SYNC][missing_ratio={ratio:.2f}] "
+                f"fold_mean={repeat_arr.mean():5.2f}% ± {repeat_arr.std():4.2f}% "
+                f"over {args.missing_ratio_repeats} repeats"
+            )
+
     print("-" * 60 + "\n")
     return best_avg_acc, best_skel_acc, best_sens_acc
 
@@ -350,6 +342,11 @@ def train_one_fold(fold_idx, reader, folds, args):
 def main(args):
     # 1) Reproducibility
     set_random_seed(args.seed)
+    print("Arguments:", args)
+    print("Dataset params:", MODALITY_PARAMS[args.dataset])
+    args._missing_ratios = parse_ratio_list(args.missing_ratios)
+    args._missing_ratio_scores = {ratio: [] for ratio in args._missing_ratios}
+    args._subset_scores = {available: [] for available, *_ in TWO_MODALITY_SUBSETS}
 
     # 2) Instantiate the appropriate reader
     reader = load_reader(args.dataset, rebuild=args.rebuild_cache)
@@ -391,6 +388,23 @@ def main(args):
     print(f"→ mean skel={mean_skel:.2f}%, sensor={mean_sens:.2f}%, avg={(mean_skel + mean_sens)/2:.2f}%")
     print("=" * 55 + "\n")
 
+    if args.eval_missing_ratios and args.synchronized_loading and all(args._missing_ratio_scores.values()):
+        if all(args._subset_scores.values()):
+            print("\n=== Modality-subset accuracy at best epoch (sync deterministic mask) ===")
+            print("Policy: deterministic subset evaluation; missing modalities are zero-filled.")
+            for available, missing, *_ in TWO_MODALITY_SUBSETS:
+                subset_arr = np.array(args._subset_scores[available], dtype=float)
+                print(
+                    f"[available={available}][missing={missing}] "
+                    f"{subset_arr.mean():5.2f}% ± {subset_arr.std():4.2f}%  over {len(subset_arr)} folds"
+                )
+
+        print("\n=== Missing-ratio accuracy at best epoch (sync inference stress test) ===")
+        print(f"Policy: sample-level Method B, {args.missing_ratio_repeats} repeats per fold; selected samples miss one modality.")
+        for ratio in args._missing_ratios:
+            ratio_arr = np.array(args._missing_ratio_scores[ratio], dtype=float)
+            print(f"[ratio={ratio:.2f}] {ratio_arr.mean():5.2f}% ± {ratio_arr.std():4.2f}%  over {len(ratio_arr)} folds")
+
     # 8) Show which subjects were held out in each fold
     print("=" * 40)
     print(" EVAL SUBJECTS PER FOLD ")
@@ -404,7 +418,14 @@ if __name__ == "__main__":
         parser.add_argument("--dataset", type=str, default="fbg", choices=["fbg","fog"])
         parser.add_argument("--rebuild_cache", action="store_true", help="Rebuild the dataset .pkl cache before training")
         parser.add_argument("--seed", type=int, default=43)
+        parser.add_argument("--wm", choices=["ce", "class_wt"], default="ce")
         parser.add_argument("--fusion_type", choices=["early","late","share_latent","cheap_xattn"], default="cheap_xattn", help="early: concat→backbone→two-heads  late: two branches→fuse logits")
         parser.add_argument("--synchronized_loading", action="store_true", help="use time-synchronized sampling for both train and eval")
+        parser.add_argument("--eval_missing_ratios", action="store_true",
+                            help="Run sync-only sample-level inference-time missing-ratio evaluation after the best epoch.")
+        parser.add_argument("--missing_ratios", type=str, default="0.2,0.4,0.6,0.8",
+                            help="Comma-separated missing ratios for --eval_missing_ratios.")
+        parser.add_argument("--missing_ratio_repeats", type=int, default=5,
+                            help="Random repeats per fold for --eval_missing_ratios.")
         args = parser.parse_args()
         main(args)

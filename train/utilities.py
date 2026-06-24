@@ -1,6 +1,6 @@
 import os
 import random
-from collections import Counter, defaultdict
+from collections import Counter
 
 import numpy as np
 import torch
@@ -8,10 +8,6 @@ import torch.nn as nn
 
 from feature_encoder import MultiModalMultiTaskModel, SensorModalityModel, SkelModalityModel
 from learning.optimizers.classification_losses import GCLLoss, LDAMLoss
-try:
-    from configs import normalize_dataset_name
-except ImportError:
-    from train.configs import normalize_dataset_name
 
 
 def set_random_seed(seed):
@@ -33,6 +29,12 @@ def flatten_skel(x):
 
 
 def choose_model(args, params, device):
+    wm = args.wm.lower()
+    legacy_gcl_head = getattr(args, "legacy_gcl_head", False)
+    gcl_forces_norm_head = wm == "gcl" and not legacy_gcl_head
+    use_cosine = args.use_norm_and_cos or gcl_forces_norm_head
+    use_norm = args.use_norm_and_cos or wm == "ldam" or gcl_forces_norm_head
+
     if args.modality == "skeleton":
         return SkelModalityModel(
             skeleton_input_dim=params["skeleton_input_dim"],
@@ -42,6 +44,8 @@ def choose_model(args, params, device):
             backbone_dim=params["backbone_dim"],
             taskhead_input_dim=params["taskhead_input_dim"],
             num_classes=params["num_classes"],
+            use_norm=use_norm,
+            use_cosine=use_cosine,
         ).to(device)
 
     if args.modality == "sensor":
@@ -53,6 +57,8 @@ def choose_model(args, params, device):
             backbone_dim=params["backbone_dim"],
             taskhead_input_dim=params["taskhead_input_dim"],
             num_classes=params["num_classes"],
+            use_norm=use_norm,
+            use_cosine=use_cosine,
         ).to(device)
 
     return MultiModalMultiTaskModel(
@@ -65,8 +71,8 @@ def choose_model(args, params, device):
         backbone_dim=params["backbone_dim"],
         taskhead_input_dim=params["taskhead_input_dim"],
         num_classes=params["num_classes"],
-        use_norm=args.use_norm_and_cos,
-        use_cosine=args.use_norm_and_cos,
+        use_norm=use_norm,
+        use_cosine=use_cosine,
         synchronized_loading=args.synchronized_loading,
     ).to(device)
 
@@ -87,43 +93,13 @@ def get_branch_class_counts(loader, num_classes):
 
 
 def generate_class_stratified_folds(reader, dataset):
-    dataset = normalize_dataset_name(dataset)
-    if dataset == "fbg":
-        pose_prefixes = {"_".join(key.split("_")[:2]) for key in reader.pose_dict.keys()}
-        sensor_prefixes = {"_".join(key.split("_")[:2]) for key in reader.sensor_dict.keys()}
-        both_modal = pose_prefixes & sensor_prefixes
-        raw = reader.pose_label_dict
-        label_dict = {subject: raw[subject] for subject in raw if subject in both_modal}
-    elif dataset == "fog":
-        label_dict = {
-            subject: reader.labels_dict[subject][0]
-            for subject in reader.labels_dict
-            if subject not in ("SUB10", "SUB30", "SUB22")
-        }
-    else:
-        raise ValueError(f"Unknown dataset: {dataset}")
+    from learning.training_common import generate_class_stratified_folds as shared_generate_class_stratified_folds
 
-    class_to_subjects = defaultdict(list)
-    for subject, label in label_dict.items():
-        class_to_subjects[label].append(subject)
-
-    fold_count = min(len(subjects) for subjects in class_to_subjects.values())
-    if fold_count == 0:
-        raise ValueError("Need at least one subject per class with both modalities for FBG")
-
-    balanced = {}
-    for label, subjects in class_to_subjects.items():
-        if len(subjects) > fold_count:
-            subjects = random.sample(subjects, k=fold_count)
-        random.shuffle(subjects)
-        balanced[label] = subjects
-
-    folds = []
-    for index in range(fold_count):
-        eval_subjects = [balanced[label][index] for label in sorted(balanced)]
-        train_subjects = [subject for subject in label_dict if subject not in eval_subjects]
-        folds.append((train_subjects, eval_subjects))
-    return folds
+    return shared_generate_class_stratified_folds(
+        reader,
+        dataset,
+        exclude_subjects=["SUB10", "SUB30", "SUB22"],
+    )
 
 
 def make_inv_freq_weights(counts, device):

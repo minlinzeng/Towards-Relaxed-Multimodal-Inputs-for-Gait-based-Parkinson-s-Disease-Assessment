@@ -1,6 +1,16 @@
 # file: focal_main_min.py
 # Minimal trainer for the FOCAL-style shared/private baseline (no pretrain, no CAGrad/GCL).
-import argparse, os, numpy as np, torch, torch.nn.functional as F
+import argparse, os, sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TRAIN_ROOT = Path(__file__).resolve().parents[1]
+for path in (PROJECT_ROOT, TRAIN_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+import numpy as np, torch, torch.nn.functional as F
 from baselines.architectures.focal import FOCALSharedLatentBaseline
 from data_processing.preprocess_fbg import PDReader
 from data_processing.preprocess_fog import pdfeReader
@@ -8,21 +18,38 @@ from data_processing.dataloader_fbg_fog import create_fusion_loaders
 from data_processing.dataset_cache import load_reader
 from learning.training_common import set_seed, flatten_skel, generate_class_stratified_folds, \
                     get_branch_class_counts, class_weight_tensor, print_class_balance, print_eval_matrix, count_params
+from learning.missing_ratio import (
+    TWO_MODALITY_SUBSETS,
+    eval_two_modality_missing_ratio_sync,
+    eval_two_modality_subset_sync,
+    parse_ratio_list,
+)
 from const.path import get_pd_paths
+try:
+    from configs import FBG_FOG_PARAMS
+except ImportError:
+    from train.configs import FBG_FOG_PARAMS
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 PATHS = get_pd_paths()
 
 HP = {
-    "fbg": dict(pose_length=101, skeleton_input_dim=51, skeleton_output_dim=3,
-                 sensor_in_channels=3, sensor_out_channels=3, sensor_length=65,
-                 shared_out_channels=16, backbone_dim=8, num_classes=3,
-                 lr=1e-3, epochs=100, batch=256),
-    "fog": dict(pose_length=101, skeleton_input_dim=21, skeleton_output_dim=6,
-                 sensor_in_channels=6, sensor_out_channels=6, sensor_length=426,
-                 shared_out_channels=16, backbone_dim=8, num_classes=3,
-                 lr=1e-3, epochs=100, batch=256),
+    dataset: dict(
+        pose_length=params["pose_length"],
+        skeleton_input_dim=params["skeleton_input_dim"],
+        skeleton_output_dim=params["skeleton_output_dim"],
+        sensor_in_channels=params["sensor_in_channels"],
+        sensor_out_channels=params["sensor_out_channels"],
+        sensor_length=params["sensor_length"],
+        shared_out_channels=params["shared_out_channels"],
+        backbone_dim=params["backbone_dim"],
+        num_classes=params["num_classes"],
+        lr=params["learning_rate"],
+        epochs=100,
+        batch=params["batch_size"],
+    )
+    for dataset, params in FBG_FOG_PARAMS.items()
 }
 
 def forward_step(batch, model, args, sk_w=None, se_w=None):
@@ -102,7 +129,7 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
         sensor_in_channels=hp["sensor_in_channels"], sensor_out_channels=hp["sensor_out_channels"],
         sensor_length=hp["sensor_length"], d_shared=16, d_private=8,
         shared_out_channels=4, backbone_dim=4,
-        num_classes=hp["num_classes"], use_norm_head=False, use_cosine_head=False
+        num_classes=hp["num_classes"], use_norm_head=False, use_cosine_head=False,
     ).to(device)
     
     total = count_params(model)                 # trainable params
@@ -115,6 +142,7 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
     se_w = None if args.wm == "ce" else class_weight_tensor(se_counts, device)
 
     best, best_avg, patience, noimp = {}, -1.0, 60, 0
+    best_state = None
     for ep in range(1, hp["epochs"]+1):
         tl, tsk, tse, *_ = run_epoch(train_loader, model, opt, args, sk_w, se_w, train=True, collect=False)
         vl, vsk, vse, T_sk, P_sk, T_se, P_se, T_ens, P_ens = run_epoch(eval_loader, model, opt, args, sk_w, se_w, train=False, collect=True)
@@ -127,6 +155,7 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
         if avg > best_avg:
             best_avg, noimp = avg, 0
             best = dict(T_sk=T_sk, P_sk=P_sk, T_se=T_se, P_se=P_se, T_ens=T_ens, P_ens=P_ens)
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             # os.makedirs(args.ckpt, exist_ok=True)
             # save_checkpoint(model, os.path.join(args.ckpt, f"focal_fold{fold}.pt"))
         else:
@@ -142,6 +171,39 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
     print_eval_matrix(best, args.synced)
 
     if args.synced:
+        if args.eval_missing_ratios and best_state is not None:
+            model.load_state_dict(best_state, strict=True)
+
+            def predict_logits(skel, sens, use_skel, use_sens):
+                log_skel, _ = model(skel, sens, synced=True)
+                return log_skel
+
+            for available, missing, use_skel, use_sens in TWO_MODALITY_SUBSETS:
+                score = eval_two_modality_subset_sync(
+                    model, eval_loader, device, flatten_skel, predict_logits, use_skel, use_sens
+                )
+                args._subset_scores[available].append(float(score))
+                print(
+                    f"[SYNC][available={available}][missing={missing}] "
+                    f"acc={score:5.2f}% over {len(eval_loader.dataset)} samples"
+                )
+
+            for ratio_idx, ratio in enumerate(args._missing_ratios):
+                repeat_scores = []
+                for rep in range(args.missing_ratio_repeats):
+                    ratio_seed = args.seed * 100000 + fold * 1000 + ratio_idx * 100 + rep
+                    score = eval_two_modality_missing_ratio_sync(
+                        model, eval_loader, ratio, ratio_seed, device, flatten_skel, predict_logits
+                    )
+                    repeat_scores.append(float(score))
+                repeat_arr = np.array(repeat_scores, dtype=float)
+                args._missing_ratio_scores[ratio].append(float(repeat_arr.mean()))
+                print(
+                    f"[SYNC][missing_ratio={ratio:.2f}] "
+                    f"fold_mean={repeat_arr.mean():5.2f}% ± {repeat_arr.std():4.2f}% "
+                    f"over {args.missing_ratio_repeats} repeats"
+                )
+
         print(f"\n*** Fold {fold} Best Acc: {sk:.2f}% ***\n")
         return sk, 0.0, sk
     else:
@@ -151,6 +213,11 @@ def train_fold(fold, reader, args, train_subj, eval_subj):
     
 def main(args):
     set_seed(args.seed)
+    print("Arguments:", args)
+    print("Dataset params:", HP[args.dataset])
+    args._missing_ratios = parse_ratio_list(args.missing_ratios)
+    args._missing_ratio_scores = {ratio: [] for ratio in args._missing_ratios}
+    args._subset_scores = {available: [] for available, *_ in TWO_MODALITY_SUBSETS}
     reader = load_reader(args.dataset, rebuild=args.rebuild_cache)
     folds = generate_class_stratified_folds(reader, args.dataset, exclude_subjects=["SUB10","SUB30","SUB22"])
     out = []
@@ -161,14 +228,36 @@ def main(args):
     msk, mse, mav = out.mean(axis=0)
     print(f"\nMean Acc: {mav:.2f}%") if args.synced else \
         print(f"\nMean skel={msk:.2f}%  sensor={mse:.2f}%  avg={mav:.2f}%")
+    if args.synced and args.eval_missing_ratios and all(args._missing_ratio_scores.values()):
+        if all(args._subset_scores.values()):
+            print("\n=== Modality-subset accuracy at best epoch (sync deterministic mask) ===")
+            print("Policy: deterministic subset evaluation; missing modalities are zero-filled.")
+            for available, missing, *_ in TWO_MODALITY_SUBSETS:
+                subset_arr = np.array(args._subset_scores[available], dtype=float)
+                print(
+                    f"[available={available}][missing={missing}] "
+                    f"{subset_arr.mean():5.2f}% ± {subset_arr.std():4.2f}%  over {len(subset_arr)} folds"
+                )
+
+        print("\n=== Missing-ratio accuracy at best epoch (sync inference stress test) ===")
+        print(f"Policy: sample-level Method B, {args.missing_ratio_repeats} repeats per fold; selected samples miss one modality.")
+        for ratio in args._missing_ratios:
+            ratio_arr = np.array(args._missing_ratio_scores[ratio], dtype=float)
+            print(f"[ratio={ratio:.2f}] {ratio_arr.mean():5.2f}% ± {ratio_arr.std():4.2f}%  over {len(ratio_arr)} folds")
 
 if __name__ == "__main__":
-        p = argparse.ArgumentParser("FOCAL minimal trainer")
-        p.add_argument("--dataset", choices=["fog","fbg"], default="fog")
-        p.add_argument("--rebuild_cache", action="store_true", help="Rebuild the dataset .pkl cache before training")
-        p.add_argument("--synced", action="store_true", help="Require paired inputs; enables ensemble & KL consistency")
-        p.add_argument("--wm", choices=["ce","class_wt"], default="ce")
-        p.add_argument("--seed", type=int, default=43)
-        # p.add_argument("--use_norm_and_cos", action="store_true")
-        p.add_argument("--consistency_lambda", type=float, default=1.0)
-        main(p.parse_args())
+    p = argparse.ArgumentParser("FOCAL minimal trainer")
+    p.add_argument("--dataset", choices=["fog", "fbg"], default="fog")
+    p.add_argument("--rebuild_cache", action="store_true", help="Rebuild the dataset .pkl cache before training")
+    p.add_argument("--synced", action="store_true", help="Require paired inputs; enables ensemble & KL consistency")
+    p.add_argument("--wm", choices=["ce", "class_wt"], default="ce")
+    p.add_argument("--seed", type=int, default=43)
+    # p.add_argument("--use_norm_and_cos", action="store_true")
+    p.add_argument("--consistency_lambda", type=float, default=1.0)
+    p.add_argument("--eval_missing_ratios", action="store_true",
+                   help="Run sync-only sample-level inference-time missing-ratio evaluation after the best epoch.")
+    p.add_argument("--missing_ratios", type=str, default="0.2,0.4,0.6,0.8",
+                   help="Comma-separated missing ratios for --eval_missing_ratios.")
+    p.add_argument("--missing_ratio_repeats", type=int, default=5,
+                   help="Random repeats per fold for --eval_missing_ratios.")
+    main(p.parse_args())

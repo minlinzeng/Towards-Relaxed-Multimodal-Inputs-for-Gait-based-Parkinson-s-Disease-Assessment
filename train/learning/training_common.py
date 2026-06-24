@@ -72,16 +72,25 @@ def generate_class_stratified_folds(
     for subject, label in label_dict.items():
         by_class.setdefault(int(label), []).append(subject)
 
-    smallest_class_size = min(len(subjects) for subjects in by_class.values())
-    if smallest_class_size == 0:
+    fold_count = min(len(subjects) for subjects in by_class.values())
+    if fold_count == 0:
         raise ValueError("At least one class has zero usable subjects.")
 
-    for key in by_class:
-        random.shuffle(by_class[key])
+    # Keep the fold policy aligned with the original FBG/FoG trainer: when a
+    # class has more subjects than the minority class, sample down first and
+    # then shuffle. Changing this order changes the held-out subjects for the
+    # same seed, which breaks paired baseline comparisons.
+    balanced: Dict[int, List[str]] = {}
+    for label, subjects in by_class.items():
+        subjects = list(subjects)
+        if len(subjects) > fold_count:
+            subjects = random.sample(subjects, k=fold_count)
+        random.shuffle(subjects)
+        balanced[label] = subjects
 
     folds: List[Tuple[List[str], List[str]]] = []
-    for index in range(smallest_class_size):
-        eval_subjects = [by_class[label][index] for label in sorted(by_class)]
+    for index in range(fold_count):
+        eval_subjects = [balanced[label][index] for label in sorted(balanced)]
         train_subjects = [subject for subject in label_dict if subject not in eval_subjects]
         folds.append((train_subjects, eval_subjects))
     return folds

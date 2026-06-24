@@ -72,6 +72,30 @@ def build_synced_pairs(
                 pairs.append((pk, sk))
     return pairs
 
+def build_prefix_pairs(
+    pose_keys: List[str],
+    sens_keys: List[str]) -> List[Tuple[str,str]]:
+    """
+    FBG pose and GRF keys do not share trial suffixes. Pair them by the
+    subject/medication prefix, cycling the shorter modality within each prefix.
+    """
+    pose_map = defaultdict(list)
+    sens_map = defaultdict(list)
+    for key in pose_keys:
+        pose_map["_".join(key.split("_")[:2])].append(key)
+    for key in sens_keys:
+        sens_map["_".join(key.split("_")[:2])].append(key)
+
+    pairs = []
+    for prefix, pkeys in pose_map.items():
+        skeys = sens_map.get(prefix, [])
+        if not pkeys or not skeys:
+            continue
+        max_len = max(len(pkeys), len(skeys))
+        for index in range(max_len):
+            pairs.append((pkeys[index % len(pkeys)], skeys[index % len(skeys)]))
+    return pairs
+
 def oversample_equally(
     pairs: List[Tuple[str,str]],
     get_label: callable) -> List[Tuple[str,str]]:
@@ -81,6 +105,8 @@ def oversample_equally(
     cls2pairs = defaultdict(list)
     for pk, sk in pairs:
         cls2pairs[get_label(pk)].append((pk, sk))
+    if not cls2pairs:
+        raise ValueError("Cannot oversample synchronized pairs because no usable pose/sensor pairs were found.")
     max_n = max(len(v) for v in cls2pairs.values())
     balanced = []
     for c, group in cls2pairs.items():
@@ -193,9 +219,12 @@ class FusionDataset(Dataset):
 
         # if time-sync requested, build (pose_key, sensor_key) pairs
         if self.synchronized:
-            pose_map = group_by_subject(self.pose_ds.keys)
-            sens_map = group_by_subject(self.sens_ds.keys)
-            pairs    = build_synced_pairs(pose_map, sens_map)
+            if self.pose_label_map is not None and self.sensor_label_map is not None:
+                pairs = build_prefix_pairs(self.pose_ds.keys, self.sens_ds.keys)
+            else:
+                pose_map = group_by_subject(self.pose_ds.keys)
+                sens_map = group_by_subject(self.sens_ds.keys)
+                pairs    = build_synced_pairs(pose_map, sens_map)
 
             if seed is not None:
                 random.seed(seed)
@@ -277,7 +306,8 @@ def create_fusion_loaders(
     num_workers:    int  = 4,
     pad_skel:       int  = DEFAULT_SKELETON_LEN,
     pad_sens:       int  = DEFAULT_SENSOR_LEN,
-    modality:       str  = "multimodal"
+    modality:       str  = "multimodal",
+    sync_train_oversample: bool = False
 ) -> Tuple[DataLoader,DataLoader]:
     """
     Builds train & eval DataLoaders of (optionally) time-aligned multimodal data.
@@ -349,9 +379,12 @@ def create_fusion_loaders(
             print(f"[WARN] dropping train subjects missing {modality} data: {dropped}")
 
     # 3) build datasets
-    ds_seed_train = None if synchronized else seed
+    ds_seed_train = seed if (not synchronized or sync_train_oversample) else None
     # ds_seed_train = seed
     ds_seed_eval  = seed
+    if synchronized:
+        state = "on" if sync_train_oversample else "off"
+        print(f"[SYNC] train oversampling={state}; eval uses deterministic class-balanced pairs.")
     train_ds = FusionDataset(
         pose_dict, sensor_dict,
         subject_label_map, pose_label_map, sensor_label_map,

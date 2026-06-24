@@ -19,10 +19,16 @@ import torch.nn.functional as F
 from data_processing.dataset_cache import load_reader
 from data_processing.dataloader_fbg_fog import create_fusion_loaders
 try:
-    from configs import FBG_FOG_PARAMS, normalize_dataset_name
+    from configs import FBG_FOG_PARAMS, FBG_FOG_PARAM_PRESETS, normalize_dataset_name
 except ImportError:
-    from train.configs import FBG_FOG_PARAMS, normalize_dataset_name
+    from train.configs import FBG_FOG_PARAMS, FBG_FOG_PARAM_PRESETS, normalize_dataset_name
 from learning.optimizers.multitask_weighting import CAGrad
+from learning.missing_ratio import (
+    TWO_MODALITY_SUBSETS,
+    eval_two_modality_missing_ratio_sync,
+    eval_two_modality_subset_sync,
+    parse_ratio_list,
+)
 from learning.training_common import count_params
 from sklearn.metrics import classification_report, confusion_matrix
 from utilities import (
@@ -38,6 +44,46 @@ from utilities import (
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def apply_param_preset(args):
+    """Apply named FBG/FoG reproduction settings to parsed CLI args."""
+    args._param_overrides = {}
+    preset_name = (getattr(args, "param_preset", "") or "").strip()
+    if not preset_name:
+        return
+
+    preset = FBG_FOG_PARAM_PRESETS.get(preset_name)
+    if preset is None:
+        available = ", ".join(sorted(FBG_FOG_PARAM_PRESETS)) or "(none)"
+        raise ValueError(f"Unknown --param_preset '{preset_name}'. Available: {available}")
+
+    expected_dataset = preset.get("dataset")
+    if expected_dataset and args.dataset != expected_dataset:
+        raise ValueError(
+            f"--param_preset {preset_name} is for dataset={expected_dataset}, "
+            f"but current dataset={args.dataset}."
+        )
+    if preset.get("sync_required") and not args.synchronized_loading:
+        raise ValueError(f"--param_preset {preset_name} requires --synchronized_loading.")
+
+    for key, value in preset.get("args", {}).items():
+        setattr(args, key, value)
+    args._param_overrides.update(preset.get("train_params", {}))
+
+    arg_text = ", ".join(f"{k}={v}" for k, v in sorted(preset.get("args", {}).items()))
+    train_text = ", ".join(f"{k}={v}" for k, v in sorted(args._param_overrides.items()))
+    print(f"[PRESET] Applied {preset_name}: args({arg_text}); train_params({train_text})")
+
+
+def apply_train_param_overrides(args):
+    """Apply explicit CLI overrides for config-level training parameters."""
+    overrides = getattr(args, "_param_overrides", {})
+    if getattr(args, "epochs", None) is not None:
+        overrides["epochs"] = args.epochs
+    if getattr(args, "batch_size", None) is not None:
+        overrides["batch_size"] = args.batch_size
+    args._param_overrides = overrides
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +315,8 @@ def run_epoch(
 def train_one_fold(fold_idx, reader, args, train_subj, eval_subj):
     """Train and evaluate one subject-level fold."""
     args.dataset = normalize_dataset_name(args.dataset)
-    params = FBG_FOG_PARAMS[args.dataset]
+    params = dict(FBG_FOG_PARAMS[args.dataset])
+    params.update(getattr(args, "_param_overrides", {}))
 
     # Data: cached raw readers are converted into train/eval PyTorch loaders.
     train_loader, eval_loader = create_fusion_loaders(
@@ -280,12 +327,18 @@ def train_one_fold(fold_idx, reader, args, train_subj, eval_subj):
         num_workers  = 4,
         pad_skel     = params["pose_length"],
         pad_sens     = params["sensor_length"],
-        modality     = args.modality)
+        modality     = args.modality,
+        sync_train_oversample = args.sync_train_oversample)
 
     # Model/optimizer: model type is selected from --modality.
     model = choose_model(args, params, DEVICE)
     print(f"Total params: {count_params(model):,}")
-    optimizer = optim.SGD(model.parameters(), lr=params["learning_rate"], momentum=0.9, weight_decay=1e-4)
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=params["learning_rate"],
+        momentum=args.sgd_momentum,
+        weight_decay=args.weight_decay,
+    )
     grad_method = (CAGrad(n_tasks=2, device=DEVICE, c=args.alpha, max_norm=args.max_norm) if args.alpha > 0 else None)
 
     # Losses: LDAM/GCL/class weights need branch-specific class counts.
@@ -296,8 +349,9 @@ def train_one_fold(fold_idx, reader, args, train_subj, eval_subj):
 
     best_avg     = 0.0
     best_trues_sk, best_preds_sk, best_trues_se, best_preds_se, best_trues_ens, best_preds_ens  = [], [], [], [], [], []
+    best_state = None
     no_improve    = 0
-    patience      = 100
+    patience      = args.patience
     train_losses = []
     val_losses   = []
     for ep in range(params["epochs"]): 
@@ -351,6 +405,7 @@ def train_one_fold(fold_idx, reader, args, train_subj, eval_subj):
 
         if avg > best_avg:
             best_avg, best_trues_sk, best_preds_sk, best_trues_se, best_preds_se = avg, t_sk, p_sk, t_se, p_se
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             if args.modality=="multimodal":
                 best_trues_ens, best_preds_ens = t_ens, p_ens
             no_improve = 0
@@ -387,16 +442,71 @@ def train_one_fold(fold_idx, reader, args, train_subj, eval_subj):
         print(f"\n*** Fold {fold_idx} Best skel={sk_acc:.2f}%  sens={se_acc:.2f}%, avg={best_avg:.2f}% ***\n")
 
     if args.modality in ("multimodal", "skeleton"):
-        print("Best Skeleton Report:")
+        if args.modality == "multimodal" and args.synchronized_loading:
+            print("Skeleton Report at Best Ensemble Epoch:")
+        else:
+            print("Best Skeleton Report:")
         print(classification_report(best_trues_sk, best_preds_sk, digits=2, zero_division=0))
-        print("Best Skeleton Confusion Matrix:")
+        if args.modality == "multimodal" and args.synchronized_loading:
+            print("Skeleton Confusion Matrix at Best Ensemble Epoch:")
+        else:
+            print("Best Skeleton Confusion Matrix:")
         print(confusion_matrix(best_trues_sk, best_preds_sk))
 
     if args.modality in ("multimodal", "sensor"):
-        print("Best Sensor Report:")
+        if args.modality == "multimodal" and args.synchronized_loading:
+            print("Sensor Report at Best Ensemble Epoch:")
+        else:
+            print("Best Sensor Report:")
         print(classification_report(best_trues_se, best_preds_se, digits=2, zero_division=0))
-        print("Best Sensor Confusion Matrix:")
+        if args.modality == "multimodal" and args.synchronized_loading:
+            print("Sensor Confusion Matrix at Best Ensemble Epoch:")
+        else:
+            print("Best Sensor Confusion Matrix:")
         print(confusion_matrix(best_trues_se, best_preds_se))
+
+    if (
+        args.eval_missing_ratios
+        and args.modality == "multimodal"
+        and args.synchronized_loading
+        and best_state is not None
+    ):
+        model.load_state_dict(best_state, strict=True)
+
+        def predict_logits(skel, sens, use_skel, use_sens):
+            log_skel, log_sens = model(skel, sens)
+            probs = []
+            if use_skel:
+                probs.append(F.softmax(log_skel, dim=1))
+            if use_sens:
+                probs.append(F.softmax(log_sens, dim=1))
+            return sum(probs) / len(probs)
+
+        for available, missing, use_skel, use_sens in TWO_MODALITY_SUBSETS:
+            score = eval_two_modality_subset_sync(
+                model, eval_loader, DEVICE, flatten_skel, predict_logits, use_skel, use_sens
+            )
+            args._subset_scores[available].append(float(score))
+            print(
+                f"[SYNC][available={available}][missing={missing}] "
+                f"acc={score:5.2f}% over {len(eval_loader.dataset)} samples"
+            )
+
+        for ratio_idx, ratio in enumerate(args._missing_ratios):
+            repeat_scores = []
+            for rep in range(args.missing_ratio_repeats):
+                ratio_seed = args.seed * 100000 + fold_idx * 1000 + ratio_idx * 100 + rep
+                score = eval_two_modality_missing_ratio_sync(
+                    model, eval_loader, ratio, ratio_seed, DEVICE, flatten_skel, predict_logits
+                )
+                repeat_scores.append(float(score))
+            repeat_arr = np.array(repeat_scores, dtype=float)
+            args._missing_ratio_scores[ratio].append(float(repeat_arr.mean()))
+            print(
+                f"[SYNC][missing_ratio={ratio:.2f}] "
+                f"fold_mean={repeat_arr.mean():5.2f}% ± {repeat_arr.std():4.2f}% "
+                f"over {args.missing_ratio_repeats} repeats"
+            )
         
     if args.modality=="multimodal" and args.synchronized_loading:
         print("Best Ensemble Report:")
@@ -410,6 +520,15 @@ def train_one_fold(fold_idx, reader, args, train_subj, eval_subj):
 def main(args):
     set_random_seed(args.seed)
     args.dataset = normalize_dataset_name(args.dataset)
+    apply_param_preset(args)
+    apply_train_param_overrides(args)
+    if args.wm.lower() == "gcl" and not args.use_norm_and_cos and not args.legacy_gcl_head:
+        args.use_norm_and_cos = True
+        print("[INFO] Enabled use_norm_and_cos because GCL requires bounded cosine logits.")
+    elif args.wm.lower() == "gcl" and args.legacy_gcl_head:
+        print("[WARN] Using legacy GCL head without forced normalization/cosine logits.")
+    print("Effective arguments: ", args)
+    args._missing_ratios = parse_ratio_list(args.missing_ratios)
 
     reader = load_reader(args.dataset, rebuild=args.rebuild_cache)
     folds = generate_class_stratified_folds(reader, args.dataset)
@@ -423,6 +542,9 @@ def main(args):
 
     for mod in modes:
         args.modality = mod
+        if args.eval_missing_ratios and args.synchronized_loading and mod == "multimodal":
+            args._missing_ratio_scores = {ratio: [] for ratio in args._missing_ratios}
+            args._subset_scores = {available: [] for available, *_ in TWO_MODALITY_SUBSETS}
         print(f"\n>>> MODE: {mod.upper()} <<<")
         results = []
         for idx,(t,e) in enumerate(folds,1):
@@ -432,6 +554,21 @@ def main(args):
         mean_sk, mean_se, mean_av = arr.mean(axis=0)
         if args.modality=="multimodal" and args.synchronized_loading:
             print(f"mean Ensemble Acc: {mean_av:.2f}%")
+            if args.eval_missing_ratios and getattr(args, "_subset_scores", None) and all(args._subset_scores.values()):
+                print("\n=== Modality-subset accuracy at best epoch (sync deterministic mask) ===")
+                print("Policy: deterministic subset evaluation; missing modalities are zero-filled.")
+                for available, missing, *_ in TWO_MODALITY_SUBSETS:
+                    subset_arr = np.array(args._subset_scores[available], dtype=float)
+                    print(
+                        f"[available={available}][missing={missing}] "
+                        f"{subset_arr.mean():5.2f}% ± {subset_arr.std():4.2f}%  over {len(subset_arr)} folds"
+                    )
+            if args.eval_missing_ratios and args._missing_ratio_scores and all(args._missing_ratio_scores.values()):
+                print("\n=== Missing-ratio accuracy at best epoch (sync inference stress test) ===")
+                print(f"Policy: sample-level Method B, {args.missing_ratio_repeats} repeats per fold; selected samples miss one modality.")
+                for ratio in args._missing_ratios:
+                    ratio_arr = np.array(args._missing_ratio_scores[ratio], dtype=float)
+                    print(f"[ratio={ratio:.2f}] {ratio_arr.mean():5.2f}% ± {ratio_arr.std():4.2f}%  over {len(ratio_arr)} folds")
         else:
             print(f"mean skel={mean_sk:.2f}%, sensor={mean_se:.2f}%, avg={mean_av:.2f}%")
 
@@ -449,17 +586,39 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=43, help="Random seed")
     parser.add_argument("--wm", type=str, default='gcl', choices=["ce", "class_wt", "ldam", "gcl"], help="Weighting method")
     parser.add_argument("--synchronized_loading", action="store_true", help="time-align pose+sensor for both train & eval")
-    parser.add_argument("--alpha", type=float, default=0.1, help="CAGrad c parameter (default 0.4)")
-    parser.add_argument("--max_norm", type=float, default=1.0, help="CAGrad gradient clipping norm")
+    parser.add_argument("--sync_train_oversample", action="store_true",
+                        help="Oversample synchronized training pairs; default keeps original train pair distribution.")
+    parser.add_argument("--alpha", type=float, default=0.3, help="CAGrad c parameter")
+    parser.add_argument("--max_norm", type=float, default=0.0, help="CAGrad gradient clipping norm; 0 disables clipping")
+    parser.add_argument("--sgd_momentum", type=float, default=0.9,
+                        help="SGD momentum.")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help="SGD weight decay.")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override dataset/preset training epochs.")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Override dataset/preset training batch size.")
+    parser.add_argument("--patience", type=int, default=100,
+                        help="Early-stopping patience in epochs.")
     parser.add_argument("--ldam_s", type=float, default=30)
     parser.add_argument("--ldam_m", type=float, default=0.5)
-    parser.add_argument("--gcl_m", type=float, default=0.2)
-    parser.add_argument("--gcl_s", type=float, default=25)
-    parser.add_argument("--noise_mul", type=float, default=0)
-    parser.add_argument("--drw_warmup", type=int, default=0, help="Number of warmup epochs before applying class re-weighting (DRW) for GCL")
+    parser.add_argument("--gcl_m", type=float, default=0.4)
+    parser.add_argument("--gcl_s", type=float, default=40)
+    parser.add_argument("--noise_mul", type=float, default=0.0)
+    parser.add_argument("--drw_warmup", type=int, default=5, help="Number of warmup epochs before applying class re-weighting (DRW) for GCL")
     parser.add_argument("--use_norm_and_cos", action="store_true")
+    parser.add_argument("--legacy_gcl_head", action="store_true",
+                        help="Use the pre-normalized-head GCL setup for reproducing old FoG runs.")
+    parser.add_argument("--param_preset", type=str, default="",
+                        help=f"Named FBG/FoG parameter preset. Available: {', '.join(sorted(FBG_FOG_PARAM_PRESETS))}")
     parser.add_argument("--save_loss_plots", action="store_true", help="Save train/eval loss curves per fold")
     parser.add_argument("--rebuild_cache", action="store_true", help="Rebuild the dataset .pkl cache before training")
+    parser.add_argument("--eval_missing_ratios", action="store_true",
+                        help="Run sync-only sample-level inference-time missing-ratio evaluation after the best epoch.")
+    parser.add_argument("--missing_ratios", type=str, default="0.2,0.4,0.6,0.8",
+                        help="Comma-separated missing ratios for --eval_missing_ratios.")
+    parser.add_argument("--missing_ratio_repeats", type=int, default=5,
+                        help="Random repeats per fold for --eval_missing_ratios.")
     return parser.parse_args()
 
 

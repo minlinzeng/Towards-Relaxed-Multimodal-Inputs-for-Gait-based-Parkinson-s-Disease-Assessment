@@ -15,13 +15,13 @@ for path in (PROJECT_ROOT, TRAIN_ROOT):
 
 from const.path import get_pd_paths
 try:
-    from configs import normalize_dataset_name, raw_reader_dataset_name
+    from configs import normalize_dataset_name, raw_reader_dataset_name, WEARGAIT_PREPROC_DIR
 except ImportError:
-    from train.configs import normalize_dataset_name, raw_reader_dataset_name
+    from train.configs import normalize_dataset_name, raw_reader_dataset_name, WEARGAIT_PREPROC_DIR
 
 
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "cache"
-WEARGAIT_CACHE_DIR = PROJECT_ROOT / "data" / "WearGait" / "WearGait_preproc_SPmT_30Hz"
+WEARGAIT_CACHE_DIR = PROJECT_ROOT / WEARGAIT_PREPROC_DIR
 
 
 def reader_cache_path(dataset: str, cache_dir: str | Path | None = None) -> Path:
@@ -61,19 +61,29 @@ def build_reader(dataset: str) -> Any:
     raise ValueError(f"Unknown cached reader dataset: {dataset}")
 
 
+def _try_load_pickle(path: Path, dataset: str, cache_label: str) -> Any | None:
+    print(f"[CACHE] Loading {dataset} reader from {cache_label} {path}")
+    try:
+        with path.open("rb") as f:
+            return pickle.load(f)
+    except (ModuleNotFoundError, ImportError, AttributeError, pickle.UnpicklingError, EOFError) as exc:
+        print(f"[CACHE] Could not load {dataset} reader cache {path}: {exc}. Rebuilding cache.")
+        return None
+
+
 def load_reader(dataset: str, *, rebuild: bool = False, cache_dir: str | Path | None = None) -> Any:
     dataset = normalize_dataset_name(dataset)
     path = reader_cache_path(dataset, cache_dir)
     if path.exists() and not rebuild:
-        print(f"[CACHE] Loading {dataset} reader from {path}")
-        with path.open("rb") as f:
-            return pickle.load(f)
+        reader = _try_load_pickle(path, dataset, "cache")
+        if reader is not None:
+            return reader
 
     legacy_path = legacy_reader_cache_path(dataset, cache_dir)
     if legacy_path.exists() and not rebuild:
-        print(f"[CACHE] Loading {dataset} reader from legacy cache {legacy_path}")
-        with legacy_path.open("rb") as f:
-            return pickle.load(f)
+        reader = _try_load_pickle(legacy_path, dataset, "legacy cache")
+        if reader is not None:
+            return reader
 
     print(f"[CACHE] Building {dataset} reader and saving to {path}")
     reader = build_reader(dataset)

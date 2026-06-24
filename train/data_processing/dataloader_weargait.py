@@ -17,35 +17,48 @@ Public API:
 
 from pathlib import Path
 from typing import Dict, List, Tuple, Any
-import json, random
+import importlib, json, random, sys
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 
+try:
+    from configs import (
+        WEARGAIT_PREPROC_DIR,
+        WEARGAIT_IMU_SITES,
+        WEARGAIT_INSOLE_NUMERIC,
+        WEARGAIT_WALKWAY_NUMERIC,
+        WEARGAIT_IMU_AXES,
+        WEARGAIT_IMU_FIXED,
+        WEARGAIT_INSOLE_FIXED,
+        WEARGAIT_WALKWAY_FIXED,
+    )
+except ImportError:
+    from train.configs import (
+        WEARGAIT_PREPROC_DIR,
+        WEARGAIT_IMU_SITES,
+        WEARGAIT_INSOLE_NUMERIC,
+        WEARGAIT_WALKWAY_NUMERIC,
+        WEARGAIT_IMU_AXES,
+        WEARGAIT_IMU_FIXED,
+        WEARGAIT_INSOLE_FIXED,
+        WEARGAIT_WALKWAY_FIXED,
+    )
+
 # ─── Config ──────────────────────────────────────────────────────────────────
-DEFAULT_DATA_DIR = Path("data/WearGait/WearGait_preproc_SPmT_30Hz")
+DEFAULT_DATA_DIR = Path(WEARGAIT_PREPROC_DIR)
 MIN_STD      = 1e-6
-IMU_SITES    = ["L_Ankle","R_Ankle","L_DorsalFoot","R_DorsalFoot","L_MidLatThigh","R_MidLatThigh","L_LatShank","R_LatShank"]
+IMU_SITES    = WEARGAIT_IMU_SITES
 DEFAULT_MODALITIES = ("walkway","insole","imu")
 # channel sets
-INSOLE_NUMERIC = [
-    "LTotalForce_BW","RTotalForce_BW","SumForce_BW",
-    "LCoP_X","LCoP_Y","RCoP_X","RCoP_Y",
-    "Linsole_Acc_X","Linsole_Acc_Y","Linsole_Acc_Z",
-    "Rinsole_Acc_X","Rinsole_Acc_Y","Rinsole_Acc_Z",
-]
-WALKWAY_NUMERIC = ["L Foot Pressure_BW","R Foot Pressure_BW"]
+INSOLE_NUMERIC = WEARGAIT_INSOLE_NUMERIC
+WALKWAY_NUMERIC = WEARGAIT_WALKWAY_NUMERIC
 
-IMU_AXES = ("E","N","U")
-IMU_FIXED = [f"{s}_FreeAcc_{ax}" for s in IMU_SITES for ax in IMU_AXES]  # 8*3 = 24
-INSOLE_FIXED = [
-    "LTotalForce_BW","RTotalForce_BW","SumForce_BW",
-    "LCoP_X","LCoP_Y","RCoP_X","RCoP_Y",
-    "Linsole_Acc_X","Linsole_Acc_Y","Linsole_Acc_Z",
-    "Rinsole_Acc_X","Rinsole_Acc_Y","Rinsole_Acc_Z",
-]
-WALKWAY_FIXED = ["L Foot Pressure_BW","R Foot Pressure_BW"]
+IMU_AXES = WEARGAIT_IMU_AXES
+IMU_FIXED = WEARGAIT_IMU_FIXED  # 8*3 = 24
+INSOLE_FIXED = WEARGAIT_INSOLE_FIXED
+WALKWAY_FIXED = WEARGAIT_WALKWAY_FIXED
 
 # ─── Subject discovery ───────────────────────────────────────────────────────
 def discover_subjects(data_dir: Path = DEFAULT_DATA_DIR) -> List[str]:
@@ -131,9 +144,28 @@ def _report_nan_health(df: pd.DataFrame, sid: str, modality: str,
 MIN_STD = 1e-6  # keep your constant
 
 # ─── I/O ─────────────────────────────────────────────────────────────────────
+def _install_numpy_pickle_compat() -> None:
+    """Allow NumPy-2-written pickles to load in NumPy-1 environments."""
+    aliases = {
+        "numpy._core": "numpy.core",
+        "numpy._core.numeric": "numpy.core.numeric",
+        "numpy._core.multiarray": "numpy.core.multiarray",
+        "numpy._core.umath": "numpy.core.umath",
+        "numpy._core._multiarray_umath": "numpy.core._multiarray_umath",
+    }
+    for missing, target in aliases.items():
+        if missing in sys.modules:
+            continue
+        try:
+            sys.modules[missing] = importlib.import_module(target)
+        except ImportError:
+            pass
+
+
 def _load_df(data_dir: Path, sid: str, suffix: str) -> pd.DataFrame:
     """Load a pickle DataFrame for a subject and suffix."""
     p = Path(data_dir) / f"{sid.lower()}_{suffix}"
+    _install_numpy_pickle_compat()
     return pd.read_pickle(p) if p.exists() else pd.DataFrame()
 
 def load_subject_streams(data_dir: Path, sid: str) -> Dict[str, pd.DataFrame]:
@@ -214,7 +246,7 @@ def apply_stats(df: pd.DataFrame, stats: dict[str, tuple[float, float]]) -> pd.D
     for c, (m, s) in stats.items():
         if c not in out.columns:
             continue
-        x = pd.to_numeric(out[c], errors="coerce").to_numpy(dtype=float)
+        x = pd.to_numeric(out[c], errors="coerce").to_numpy(dtype=float, copy=True)
 
         # replace any non-finite with the train mean before z-score
         x[~np.isfinite(x)] = m if np.isfinite(m) else 0.0

@@ -9,7 +9,7 @@ Three‐stream training for WearGait with CAGrad (shared) + GCL/CE per modality.
 Requires:
   - data_processing/dataloader_weargait.py: prepare_split, make_sync_loaders, make_async_loaders,
                          make_fixed_balanced_folds_no_overlap, build_subj2label
-  - feature_encoder_weargait.py: WearGaitThreeModal with:
+  - feature_encoder.py: WearGaitThreeModal with:
         get_shared_parameters()
         walkway_parameters(), insole_parameters(), imu_parameters()
   - optimizers.classification_losses.GCLLoss, optimizers.multitask_weighting.CAGrad
@@ -20,18 +20,18 @@ import argparse, sys, numpy as np, torch, torch.nn as nn
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-WEARGAIT_ROOT = PROJECT_ROOT / "data" / "WearGait"
-for path in (PROJECT_ROOT, Path(__file__).resolve().parent, WEARGAIT_ROOT):
+for path in (PROJECT_ROOT, Path(__file__).resolve().parent):
     path_str = str(path)
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
+from configs import WEARGAIT_HC_PATH, WEARGAIT_PD_PATH, WEARGAIT_PREPROC_DIR
 from learning.training_common import set_seed
 from data_processing.dataloader_weargait import (
     prepare_split, make_sync_loaders, make_async_loaders,
     make_fixed_balanced_folds_no_overlap, build_subj2label,
 )
-from weargait_encoders import WearGaitThreeModal, EarlyFusion3, LateFusion3, SharedLatent3, CheapXAttn3
+from feature_encoder import WearGaitThreeModal, EarlyFusion3, LateFusion3, SharedLatent3, CheapXAttn3
 from learning.optimizers.multitask_weighting import CAGrad
 from learning.optimizers.classification_losses import GCLLoss
 from baselines.architectures.deepav import DeepAVLite3
@@ -42,9 +42,9 @@ from collections import defaultdict
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-hc_path = "data/WearGait/HC"
-pd_path = "data/WearGait/PD"
-output_dir = "data/WearGait/WearGait_preproc_SPmT_30Hz"
+hc_path = WEARGAIT_HC_PATH
+pd_path = WEARGAIT_PD_PATH
+output_dir = WEARGAIT_PREPROC_DIR
 
 MASK_COMBOS = {
     "W"     : (True,  False, False),
@@ -433,6 +433,94 @@ def eval_with_mask(model, loader, async_mode, mask, verbose=False):
         return res
 
 
+def parse_ratio_list(text: str):
+    ratios = []
+    for part in text.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        value = float(item)
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"Missing ratio must be in [0, 1], got {value}")
+        ratios.append(value)
+    if not ratios:
+        raise ValueError("At least one missing ratio is required.")
+    return ratios
+
+
+def _slice_sync_batch(batch, idx):
+    return {
+        "xs": [x.index_select(0, idx) for x in batch["xs"]],
+        "y": batch["y"].index_select(0, idx),
+    }
+
+
+def _sample_missing_plan(total, ratio, rng):
+    enabled = np.ones((total, 3), dtype=bool)
+    missing_count = int(round(float(ratio) * total))
+    if missing_count <= 0:
+        return enabled
+
+    selected = rng.choice(total, size=min(missing_count, total), replace=False)
+    for sample_idx in selected:
+        # Method B: a selected sample misses one or two modalities, never all.
+        drop_count = int(rng.integers(1, 3))
+        drop = rng.choice(3, size=drop_count, replace=False)
+        enabled[sample_idx, drop] = False
+    return enabled
+
+
+@torch.no_grad()
+def eval_missing_ratio_sync(model, loader, ratio, seed, verbose=False):
+    """Sample-level inference-time missing-ratio stress test for sync data only."""
+    model.eval()
+    total = len(loader.dataset)
+    rng = np.random.default_rng(seed)
+    enabled_plan = _sample_missing_plan(total, ratio, rng)
+    patterns = [
+        (True, True, True),
+        (True, True, False),
+        (True, False, True),
+        (False, True, True),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ]
+
+    corr_sum = n_sum = offset = 0
+    for b in loader:
+        batch_n = int(b["y"].size(0))
+        batch_plan = enabled_plan[offset:offset + batch_n]
+        offset += batch_n
+
+        for pattern in patterns:
+            sample_mask = np.all(batch_plan == np.array(pattern, dtype=bool), axis=1)
+            if not np.any(sample_mask):
+                continue
+
+            idx = torch.as_tensor(np.flatnonzero(sample_mask), dtype=torch.long, device=b["y"].device)
+            sub = _slice_sync_batch(b, idx)
+            use_w, use_i, use_m = pattern
+            (lw, li, lm), (y, _, _) = forward_batch_masked(model, sub, False, use_w, use_i, use_m)
+
+            probs = []
+            if use_w:
+                probs.append(F.softmax(lw, dim=1))
+            if use_i:
+                probs.append(F.softmax(li, dim=1))
+            if use_m:
+                probs.append(F.softmax(lm, dim=1))
+            p = sum(probs) / len(probs)
+            pred = p.argmax(1)
+            corr_sum += (pred == y).sum().item()
+            n_sum += y.size(0)
+
+    acc = 100.0 * corr_sum / max(1, n_sum)
+    if verbose:
+        print(f"[SYNC][missing_ratio={ratio:.2f}] acc={acc:5.2f}% over {n_sum} samples")
+    return acc
+
+
 # ---------- CV driver ----------
 def make_loaders(prep, subj2label, args):
     mods = ("walkway","insole","imu")
@@ -491,7 +579,7 @@ def build_model(args, sync_flag: bool):
             n_tok_w=8, n_tok_i=8, n_tok_m=8,
             tau=1.0, gamma=1.5, schedule="const", dropout=0.1,
             use_time_shared=True,
-            allow_async_cross=True,        
+            allow_async_cross=True,
         ).to(DEVICE)
         # tiny flag so forward_batch knows to flatten & pass synced
         model._is_taca3tri = True
@@ -532,6 +620,10 @@ def maybe_apply_drw(args, ep, tr_loader, async_mode, criterions):
 
 def run_cv(args):
     set_seed(args.seed)
+    if args.wm.lower() == "gcl" and not args.use_cosine:
+        args.use_norm = True
+        args.use_cosine = True
+        print("[INFO] Enabled use_norm/use_cosine because GCL requires bounded cosine logits.")
 
     # subjects and folds
     pd_ids, hc_ids = discover_pd_hc(pd_path, hc_path)
@@ -544,6 +636,8 @@ def run_cv(args):
 
     mask_keys = list(MASK_COMBOS.keys())
     mask_fold_scores = {k: [] for k in mask_keys}
+    missing_ratios = parse_ratio_list(args.missing_ratios)
+    missing_ratio_fold_scores = {r: [] for r in missing_ratios}
 
     for fi, (train_subs, test_subs) in enumerate(folds, 1):
         prep = prepare_split(train_subs, test_subs, data_dir=Path(output_dir),
@@ -609,17 +703,31 @@ def run_cv(args):
                 print(f"[Fold {fi}] Early stop at epoch {ep}")
                 break
 
-        # --- restore best and run masked evals (skip if single_mod) ---
+        # --- restore best and run masked evals (sync only; async masks do not represent fused samples) ---
         if (not is_single) and best_state is not None:
             model.load_state_dict(best_state, strict=True)
-            # compute and record best-per-mask for this fold
-            for mk in mask_keys:
-                r = eval_with_mask(model, te_loader, async_mode, mk, verbose=True)
-                if async_mode:
-                    score = float(r["macro_enabled"])
-                else:
+            if not async_mode:
+                # compute and record best-per-mask for this fold
+                for mk in mask_keys:
+                    r = eval_with_mask(model, te_loader, async_mode, mk, verbose=True)
                     score = float(r)  # ensemble under enabled streams
-                mask_fold_scores[mk].append(score)
+                    mask_fold_scores[mk].append(score)
+                if args.eval_missing_ratios:
+                    for ratio_idx, ratio in enumerate(missing_ratios):
+                        repeat_scores = []
+                        for rep in range(args.missing_ratio_repeats):
+                            ratio_seed = args.seed * 100000 + fi * 1000 + ratio_idx * 100 + rep
+                            score = eval_missing_ratio_sync(
+                                model, te_loader, ratio, seed=ratio_seed, verbose=False
+                            )
+                            repeat_scores.append(float(score))
+                        repeat_arr = np.array(repeat_scores, dtype=float)
+                        missing_ratio_fold_scores[ratio].append(float(repeat_arr.mean()))
+                        print(
+                            f"[SYNC][missing_ratio={ratio:.2f}] "
+                            f"fold_mean={repeat_arr.mean():5.2f}% ± {repeat_arr.std():4.2f}% "
+                            f"over {args.missing_ratio_repeats} repeats"
+                        )
 
         print(f"[Fold {fi}] Best macro acc: {best_macro:.2f}% "
               f"(W={best_w:.2f} I={best_i:.2f} M={best_m:.2f})")
@@ -643,6 +751,13 @@ def run_cv(args):
         for mk in mask_keys:
             arr = np.array(mask_fold_scores[mk], dtype=float)
             print(f"[{mk:5}] {arr.mean():5.2f}% ± {arr.std():4.2f}%  over {len(arr)} folds")
+
+    if args.eval_missing_ratios and missing_ratio_fold_scores and all(len(v)>0 for v in missing_ratio_fold_scores.values()):
+        print("\n=== Missing-ratio accuracy at best epoch (sync inference stress test) ===")
+        print(f"Policy: sample-level Method B, {args.missing_ratio_repeats} repeats per fold; selected samples miss 1 or 2 modalities.")
+        for ratio in missing_ratios:
+            arr = np.array(missing_ratio_fold_scores[ratio], dtype=float)
+            print(f"[ratio={ratio:.2f}] {arr.mean():5.2f}% ± {arr.std():4.2f}%  over {len(arr)} folds")
 
 # ---------- CLI ----------
 if __name__ == "__main__":
@@ -683,30 +798,42 @@ if __name__ == "__main__":
     ap.add_argument("--gcl_s", type=float, default=25)
     ap.add_argument("--noise_mul", type=float, default=0.0)
     ap.add_argument("--drw_warmup", type=int, default=0)
+    ap.add_argument("--eval_missing_ratios", action="store_true",
+                    help="Run sync-only sample-level inference-time missing-ratio evaluation after the best epoch.")
+    ap.add_argument("--missing_ratios", type=str, default="0.2,0.4,0.6,0.8",
+                    help="Comma-separated missing ratios for --eval_missing_ratios.")
+    ap.add_argument("--missing_ratio_repeats", type=int, default=5,
+                    help="Random repeats per fold for --eval_missing_ratios.")
 
     # CAGrad
     ap.add_argument("--alpha", type=float, default=0.5, help="CAGrad c; 0 disables CAGrad")
 
     args = ap.parse_args()
+    print("Arguments:", args)
     run_cv(args)
 
 """
+LOG_ROOT=/home/yongjie/Minlin/CIKM-2025-Minlin/results/ablation/logs
 SEEDS=(2 3 4 42 43 44)
 for s in "${SEEDS[@]}"; do
+  logdir="$LOG_ROOT/sync/weargait/taca"
+  mkdir -p "$logdir"
   nohup python -u /home/yongjie/Minlin/CIKM-2025-Minlin/train/weargait_train.py \
     --seed "$s" \
     --baseline taca       --wm class_wt \
-    > "/home/yongjie/Minlin/CIKM-2025-Minlin/data/WearGait/logs/inverse_freq/sync_taca_wt_seed${s}.out" 2>&1 &
+    > "$logdir/seed${s}.out" 2>&1 &
   sleep 0.2
 done
 
 SEEDS=(2 3 4 42 43 44)
 for s in "${SEEDS[@]}"; do
+  logdir="$LOG_ROOT/async/weargait/deepav_lite"
+  mkdir -p "$logdir"
   nohup python -u /home/yongjie/Minlin/CIKM-2025-Minlin/train/weargait_train.py \
     --seed "$s" \
     --baseline deepav_lite       --wm class_wt \
     --async_loading \
-    > "/home/yongjie/Minlin/CIKM-2025-Minlin/data/WearGait/logs/inverse_freq/async_deepav_wt_seed${s}.out" 2>&1 &
+    > "$logdir/seed${s}.out" 2>&1 &
   sleep 0.2
 done
 

@@ -2,23 +2,59 @@ from pathlib import Path
 import json, re
 import numpy as np
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
+import sys
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+TRAIN_ROOT = PROJECT_ROOT / "train"
+for path in (PROJECT_ROOT, TRAIN_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
+try:
+    from configs import (
+        WEARGAIT_GRAV,
+        WEARGAIT_IMU_SITES,
+        WEARGAIT_CSV_PATTERN,
+        WEARGAIT_HC_PATH,
+        WEARGAIT_PD_PATH,
+        WEARGAIT_HC_DEMO_CSV,
+        WEARGAIT_PD_DEMO_CSV,
+        WEARGAIT_PREPROC_DIR,
+    )
+except ImportError:
+    from train.configs import (
+        WEARGAIT_GRAV,
+        WEARGAIT_IMU_SITES,
+        WEARGAIT_CSV_PATTERN,
+        WEARGAIT_HC_PATH,
+        WEARGAIT_PD_PATH,
+        WEARGAIT_HC_DEMO_CSV,
+        WEARGAIT_PD_DEMO_CSV,
+        WEARGAIT_PREPROC_DIR,
+    )
 
 # ========================= Config =========================
-GRAV = 9.81
-IMU_SITES = [
-    "L_Ankle","R_Ankle",
-    "L_DorsalFoot","R_DorsalFoot",
-    "L_MidLatThigh","R_MidLatThigh",
-    "L_LatShank","R_LatShank",
-]
-CSV_PATTERN = "*_SelfPace_matTURN.csv"   # adjust if needed
-hc_path = "data/WearGait/HC"
-pd_path = "data/WearGait/PD"
-hc_demo_csv = "data/WearGait/HC/hc_demographic.csv"
-pd_demo_csv = "data/WearGait/PD/pd_demographic.csv"
-output_dir = "data/WearGait/WearGait_preproc_SPmT_30Hz"
+GRAV = WEARGAIT_GRAV
+IMU_SITES = WEARGAIT_IMU_SITES
+CSV_PATTERN = WEARGAIT_CSV_PATTERN
+hc_path = WEARGAIT_HC_PATH
+pd_path = WEARGAIT_PD_PATH
+hc_demo_csv = WEARGAIT_HC_DEMO_CSV
+pd_demo_csv = WEARGAIT_PD_DEMO_CSV
+output_dir = WEARGAIT_PREPROC_DIR
 
 # ==================== Demographics I/O ====================
+def to_portable_pickle(df: pd.DataFrame, path: Path) -> None:
+    out = df.copy()
+    out.columns = [str(c) for c in out.columns]
+    for c in out.columns:
+        if not is_numeric_dtype(out[c]):
+            out[c] = out[c].astype(object)
+    out.to_pickle(path)
+
+
 def read_demographics_with_header_fix(path: str) -> pd.DataFrame:
     df0 = pd.read_csv(path, header=None, dtype=str)
     hdr_idx = 1
@@ -312,13 +348,13 @@ def run_end_to_end(
 
         # save PKLs
         if stats is None:
-            walkway.to_pickle(outdir / f"{sid_lower}_walkway.pkl")
-            insole.to_pickle (outdir / f"{sid_lower}_insole_base.pkl")
-            imu.to_pickle     (outdir / f"{sid_lower}_imu_base.pkl")
+            to_portable_pickle(walkway, outdir / f"{sid_lower}_walkway.pkl")
+            to_portable_pickle(insole,  outdir / f"{sid_lower}_insole_base.pkl")
+            to_portable_pickle(imu,     outdir / f"{sid_lower}_imu_base.pkl")
         else:
-            walkway.to_pickle(outdir / f"{sid_lower}_walkway.pkl")
-            insole.to_pickle (outdir / f"{sid_lower}_insole.pkl")
-            imu.to_pickle     (outdir / f"{sid_lower}_imu.pkl")
+            to_portable_pickle(walkway, outdir / f"{sid_lower}_walkway.pkl")
+            to_portable_pickle(insole,  outdir / f"{sid_lower}_insole.pkl")
+            to_portable_pickle(imu,     outdir / f"{sid_lower}_imu.pkl")
 
         # accumulate totals
         total_rows_w   += nw

@@ -57,17 +57,16 @@ class LDAMLoss(nn.Module):
         super(LDAMLoss, self).__init__()
         m_list = 1.0 / np.sqrt(np.sqrt(cls_num_list))
         m_list = m_list * (max_m / np.max(m_list))
-        m_list = torch.cuda.FloatTensor(m_list)
-        self.m_list = m_list
+        self.register_buffer("m_list", torch.as_tensor(m_list, dtype=torch.float32))
         assert s > 0
         self.s = s
         self.weight = weight
 
     def forward(self, x, target):
-        index = torch.zeros_like(x, dtype=torch.uint8)
+        index = torch.zeros_like(x, dtype=torch.bool)
         index.scatter_(1, target.data.view(-1, 1), 1)
         
-        index_float = index.type(torch.cuda.FloatTensor)
+        index_float = index.to(dtype=x.dtype)
         batch_m = torch.matmul(self.m_list[None, :], index_float.transpose(0,1))
         batch_m = batch_m.view((-1, 1))
         x_m = x - batch_m
@@ -80,10 +79,10 @@ class GCLLoss(nn.Module):
     
     def __init__(self, cls_num_list, m=0.5, weight=None, s=30, train_cls=False, noise_mul = 1., gamma=0.):
         super(GCLLoss, self).__init__()
-        cls_list = torch.cuda.FloatTensor(cls_num_list)
+        cls_list = torch.as_tensor(cls_num_list, dtype=torch.float32).clamp_min(1.0)
         m_list = torch.log(cls_list)
         m_list = m_list.max()-m_list
-        self.m_list = m_list
+        self.register_buffer("m_list", m_list)
         assert s > 0
         self.m = m
         self.s = s
@@ -95,7 +94,7 @@ class GCLLoss(nn.Module):
            
                                          
     def forward(self, cosine, target):
-        index = torch.zeros_like(cosine, dtype=torch.uint8)
+        index = torch.zeros_like(cosine, dtype=torch.bool)
         index.scatter_(1, target.data.view(-1, 1), 1)
              
         noise = self.simpler.sample(cosine.shape).clamp(-1, 1).to(cosine.device) #self.scale(torch.randn(cosine.shape).to(cosine.device))  
