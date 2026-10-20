@@ -1,0 +1,10 @@
+dataset,mode,cr_block,method,metric,n,acc_mean,acc_std,mod1_mean,mod2_mean,mod3_mean,seed_values
+fog,async,cr,trip,"avg(skeleton,sensor)",6,55.66,3.82,59.26,52.04,,2:50.60; 3:58.53; 4:59.82; 42:52.33; 43:54.13; 44:58.53
+fog,async,legacy/unspecified,ours,"avg(skeleton,sensor)",6,55.66,3.82,59.26,52.04,,2:50.60; 3:58.53; 4:59.82; 42:52.33; 43:54.13; 44:58.53
+fog,sync,cr,trip,ensemble,6,60.11,6.12,,,,2:64.81; 3:64.68; 4:62.47; 42:60.16; 43:48.34; 44:60.19
+fog,sync,legacy/unspecified,ours,ensemble,6,64.39,5.76,,,,2:62.96; 3:75.18; 4:64.51; 42:58.44; 43:60.91; 44:64.35
+fbg,async,legacy/unspecified,ours,"avg(skeleton,sensor)",6,54.68,0.99,44.12,65.25,,2:54.90; 3:55.48; 4:54.33; 42:55.46; 43:52.85; 44:55.08
+weargait,async,cr,ours,"avg(walkway,insole,imu)",6,70.94,0.91,70.13,60.59,82.11,2:70.79; 3:70.21; 4:69.88; 42:72.39; 43:70.87; 44:71.52
+weargait,sync,cr,trip,macro/ensemble,6,84.66,1.35,59.85,59.32,80.04,2:82.98; 3:84.62; 4:83.44; 42:86.76; 43:85.04; 44:85.09
+weargait,sync,no_cr,trip,macro/ensemble,6,84.26,1.01,60.31,58.94,80.17,2:83.37; 3:83.46; 4:83.30; 42:85.66; 43:84.79; 44:84.97
+weargait,sync,legacy/unspecified,ours,macro/ensemble,6,84.80,1.64,60.40,58.83,78.64,2:84.83; 3:83.01; 4:83.79; 42:85.15; 43:87.76; 44:84.28

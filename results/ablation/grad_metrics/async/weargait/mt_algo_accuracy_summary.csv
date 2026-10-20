@@ -1,0 +1,7 @@
+rebalance,method,runs,macro_acc_mean,macro_acc_std,seed_values,source
+cr,MGDA,6,71.15,0.6712426287615143,71.11 70.41 70.19 72.01 71.36 71.82,current logs
+cr,FairGrad,6,71.04333333333334,0.8352378237497532,70.76 70.66 69.83 72.56 70.98 71.47,current logs
+cr,TRIP,6,70.76466666666667,0.9459775660952816,69.312 70.768 69.715 71.529 71.447 71.817,preserved values from generate_rebuttal_stat_figures.py / weargait_preserved_results
+no_cr,MGDA,6,70.19166666666666,0.5141794974087895,70.35 69.75 69.44 71.08 70.24 70.29,current logs
+no_cr,FairGrad,6,70.335,0.6596147865736982,69.91 70.35 69.34 70.82 71.42 70.17,current logs
+no_cr,TRIP,6,70.76466666666667,0.9459775660952816,69.312 70.768 69.715 71.529 71.447 71.817,preserved values from generate_rebuttal_stat_figures.py / weargait_preserved_results

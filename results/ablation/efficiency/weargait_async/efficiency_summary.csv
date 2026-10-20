@@ -1,0 +1,11 @@
+metric,method,available_modalities,mean,std,unit,overhead_pct,n
+training_time_per_epoch,w/o MOO,,0.2825091699603945,0.009644955229955003,s/epoch,,10
+peak_training_gpu_memory,w/o MOO,,20.775390625,0.0,MiB,,10
+training_time_per_epoch,TRIP,,0.6071740954648703,0.02767284091977843,s/epoch,114.9219069773881,10
+peak_training_gpu_memory,TRIP,,23.41455078125,0.0,MiB,12.703299802575915,10
+inference_latency,w/o MOO,1,0.600784261788552,0.0032726023388588215,ms/window,,10
+inference_latency,w/o MOO,2,1.1197925543723006,0.008139792630292327,ms/window,,10
+inference_latency,w/o MOO,3,1.629957722639665,0.020597122522461077,ms/window,,10
+inference_latency,TRIP,1,0.5813210632807264,0.004553900990723521,ms/window,,10
+inference_latency,TRIP,2,1.116320407188808,0.006093802296511801,ms/window,,10
+inference_latency,TRIP,3,1.6222494800575078,0.01420127380147715,ms/window,,10

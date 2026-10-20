@@ -1,0 +1,46 @@
+{
+  "dataset": "WearGait",
+  "mode": "async",
+  "class_rebalancing": "gcl",
+  "gpu": "Tesla V100-PCIE-32GB",
+  "gpu_index": 0,
+  "torch_version": "2.8.0+cu128",
+  "cuda_version": "12.8",
+  "python_version": "3.10.18",
+  "seed": 42,
+  "fold": 1,
+  "n_folds": 10,
+  "test_per_class": 8,
+  "batch_size": 64,
+  "batches_per_epoch": 33,
+  "samples_per_epoch": 2087,
+  "train_repeats": 10,
+  "warmup_epochs_per_repeat": 1,
+  "inference_batch_size": 1,
+  "inference_repeats": 10,
+  "inference_warmup_iterations": 100,
+  "inference_iterations_per_repeat": 1000,
+  "inference_weights": "final in-memory state from the last profiled training repeat; no checkpoint saved",
+  "architecture": {
+    "enc_out_ch": 12,
+    "backbone_dim": 8,
+    "shared_out_ch": 16,
+    "use_norm": true,
+    "use_cosine": true
+  },
+  "optimizer": {
+    "name": "SGD",
+    "lr": 0.001,
+    "momentum": 0.9,
+    "weight_decay": 0.0001
+  },
+  "trip": {
+    "grad_method": "cagrad",
+    "alpha": 0.5,
+    "max_norm": 1.0
+  },
+  "without_moo": {
+    "grad_method": "none"
+  },
+  "timing_scope": "training batches only; excludes preprocessing and validation; includes host-to-device transfer and CAGrad CPU solver"
+}

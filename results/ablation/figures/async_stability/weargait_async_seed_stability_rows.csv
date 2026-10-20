@@ -1,0 +1,7 @@
+dataset,seed,final_macro_acc,weakest_branch_acc,walkway_acc,insole_acc,imu_acc,source
+WearGait,2,70.76,59.81,70.44,59.81,82.02,/home/yongjie/Minlin/CIKM-2025-Minlin/results/ablation/logs/async/weargait/cr/ours_fairgrad/seed2.out
+WearGait,3,70.66,60.26,70.27,60.26,81.45,/home/yongjie/Minlin/CIKM-2025-Minlin/results/ablation/logs/async/weargait/cr/ours_fairgrad/seed3.out
+WearGait,4,69.83,60.96,68.69,60.96,79.83,/home/yongjie/Minlin/CIKM-2025-Minlin/results/ablation/logs/async/weargait/cr/ours_fairgrad/seed4.out
+WearGait,42,72.56,62.52,71.68,62.52,83.49,/home/yongjie/Minlin/CIKM-2025-Minlin/results/ablation/logs/async/weargait/cr/ours_fairgrad/seed42.out
+WearGait,43,70.98,61.51,68.61,61.51,82.83,/home/yongjie/Minlin/CIKM-2025-Minlin/results/ablation/logs/async/weargait/cr/ours_fairgrad/seed43.out
+WearGait,44,71.47,61.52,70.47,61.52,82.41,/home/yongjie/Minlin/CIKM-2025-Minlin/results/ablation/logs/async/weargait/cr/ours_fairgrad/seed44.out

@@ -1,0 +1,2 @@
+dataset,n_seeds,final_macro_acc_mean,final_macro_acc_std,final_macro_acc_min,final_macro_acc_max,weakest_branch_acc_mean,weakest_branch_acc_std,weakest_branch_acc_min,weakest_branch_acc_max
+WearGait,6,71.0433,0.8352,69.8300,72.5600,61.0967,0.8898,59.8100,62.5200
